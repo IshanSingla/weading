@@ -1,0 +1,309 @@
+# This file is managed by DataDack Cloud (project weading).
+# Edit it freely — we never force-push. When the managed workflow changes we
+# open a pull request proposing the update and you decide whether to take it.
+#
+# What it does: on every push to main it builds this app on YOUR GitHub Actions
+# runners, packs the build output into one zip archive, and uploads that zip to
+# DataDack object storage. Your source code is never sent to DataDack.
+#
+# datadack-workflow-version: 10
+name: DataDack Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read      # read the checked-out commit
+  id-token: write     # prove to DataDack which repository this run belongs to
+
+concurrency:
+  # A newer commit makes an in-flight build pointless, so cancel it. DataDack
+  # marks the superseded build accordingly.
+  group: datadack-deploy-main
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and upload artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATADACK_API: https://console.datadack.cloud/api/v1
+      DATADACK_PROJECT_ID: 01a015fb-90ae-7313-9a36-d9a93e11d903
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Bun
+        run: npm install --global bun@1
+
+      - name: Claim a build from DataDack
+        id: claim
+        run: |
+          # A short-lived OIDC token, minted by GitHub, that proves which
+          # repository and workflow this run is. It is not stored anywhere and
+          # cannot be replayed after it expires.
+          OIDC=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=datadack-cloud" | jq -r '.value')
+          echo "::add-mask::$OIDC"
+          echo "oidc=$OIDC" >> "$GITHUB_OUTPUT"
+
+          curl -sS --fail-with-body -X POST \
+            "$DATADACK_API/managedapps/actions/builds/claim" \
+            -H "Authorization: Bearer $OIDC" \
+            -H "Content-Type: application/json" \
+            -d "{\"run_id\":\"$GITHUB_RUN_ID\",\"run_attempt\":\"$GITHUB_RUN_ATTEMPT\",\"sha\":\"$GITHUB_SHA\",\"ref\":\"$GITHUB_REF\",\"run_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}" \
+            -o claim.json
+
+          echo "build_id=$(jq -r '.data.build_id' claim.json)" >> "$GITHUB_OUTPUT"
+          echo "upload_url=$(jq -r '.data.upload_url' claim.json)" >> "$GITHUB_OUTPUT"
+          echo "image_upload_url=$(jq -r '.data.image_upload_url' claim.json)" >> "$GITHUB_OUTPUT"
+          echo "log_url=$(jq -r '.data.log_url' claim.json)" >> "$GITHUB_OUTPUT"
+
+          # Your project's environment variables, masked before they can reach
+          # this log, then exported for the install and build steps.
+          jq -r '.data.env // {} | to_entries[] | "::add-mask::" + .value' claim.json
+          jq -r '.data.env // {} | to_entries[] | .key + "=" + .value' claim.json >> "$GITHUB_ENV"
+
+      - name: Start streaming logs to DataDack
+        run: |
+          # Everything the build prints is appended to this file; a background
+          # loop ships whatever is new every few seconds so the DataDack console
+          # shows output WHILE the build runs. GitHub's own run-logs API only
+          # serves a finished run, so without this the console would sit empty
+          # until the job ended.
+          : > "$RUNNER_TEMP/datadack.log"
+          (
+            OFFSET=0
+            while true; do
+              SIZE=$(wc -c < "$RUNNER_TEMP/datadack.log" 2>/dev/null || echo 0)
+              if [ "$SIZE" -gt "$OFFSET" ]; then
+                # jq -Rs JSON-encodes the raw bytes, so a build printing quotes,
+                # newlines or ANSI color cannot break the request body.
+                tail -c "+$((OFFSET + 1))" "$RUNNER_TEMP/datadack.log" \
+                  | jq -Rs '{chunk: .}' > "$RUNNER_TEMP/datadack.chunk.json"
+                if curl -sS --fail-with-body -X POST \
+                  "${{ steps.claim.outputs.log_url }}" \
+                  -H "Authorization: Bearer ${{ steps.claim.outputs.oidc }}" \
+                  -H "Content-Type: application/json" \
+                  --data-binary "@$RUNNER_TEMP/datadack.chunk.json" >/dev/null; then
+                  OFFSET=$SIZE
+                fi
+              fi
+              [ -f "$RUNNER_TEMP/datadack.done" ] && break
+              sleep 3
+            done
+          ) &
+          echo "$!" > "$RUNNER_TEMP/datadack.streamer"
+
+      - name: Install dependencies
+        run: set -o pipefail; { bun install --frozen-lockfile ; } 2>&1 | tee -a "$RUNNER_TEMP/datadack.log"
+
+      - name: Configure OpenNext for self-hosting
+        run: |
+          set -e
+          cd '.'
+          if ls open-next.config.* >/dev/null 2>&1; then
+            echo "using the open-next config already in this repository"
+            exit 0
+          fi
+          # Created only because you have none. Commit your own to take control
+          # of it; this file is not written over anything you wrote.
+          cat > open-next.config.ts <<'DATADACK_OPENNEXT'
+          export default {
+            default: {
+              override: {
+                wrapper: "node",
+                converter: "node",
+                incrementalCache: "fs-dev",
+                tagCache: "fs-dev",
+                queue: "direct",
+              },
+            },
+          };
+          DATADACK_OPENNEXT
+          cat open-next.config.ts | tee -a "$RUNNER_TEMP/datadack.log"
+
+      - name: Build
+        # OpenNext runs your own build script and then emits .open-next, which is what gets packed below.
+        run: set -o pipefail; { npx --yes @opennextjs/aws@latest build ; } 2>&1 | tee -a "$RUNNER_TEMP/datadack.log"
+
+
+      - name: Verify OpenNext produced a server, not a Lambda handler
+        run: |
+          set -e
+          OUT='.'/.open-next/open-next.output.json
+          if [ ! -f "$OUT" ]; then
+            echo "::error::$OUT is missing — the OpenNext build did not complete"; exit 1
+          fi
+          # Read the DEFAULT origin specifically. The file lists several origins
+          # and imageOptimizer comes first, legitimately still on aws-lambda —
+          # so grepping the first "wrapper" in the file reports aws-lambda even
+          # when the server is correctly built as a node server, and fails every
+          # build. Parse it properly rather than pattern-matching.
+          WRAPPER=$(node -p "JSON.parse(require('fs').readFileSync('$OUT','utf8')).origins.default.wrapper" 2>/dev/null || echo "")
+          echo "opennext wrapper: ${WRAPPER:-unknown}" | tee -a "$RUNNER_TEMP/datadack.log"
+          case "$WRAPPER" in
+            node|node-streaming) ;;
+            *)
+              echo "::error::OpenNext built for '${WRAPPER}', not a self-hosted server."
+              echo "::error::That bundle exports a Lambda handler and never listens on a port."
+              exit 1 ;;
+          esac
+
+      - name: Pack the build output
+        # A plain zip of the distribution directory: universally unpackable,
+        # inspectable with any archive tool, and served as-is from storage.
+        run: cd '.open-next' && zip -qr "$RUNNER_TEMP/dist.zip" .
+
+      - name: Upload the artifact to DataDack
+        run: |
+          curl -sS --fail-with-body -X PUT \
+            --upload-file "$RUNNER_TEMP/dist.zip" \
+            -H "Content-Type: application/zip" \
+            "${{ steps.claim.outputs.upload_url }}"
+
+      - name: Build the runtime image
+        run: |
+          set -e
+          # The image is assembled from the build OUTPUT, not from your
+          # repository: the build context below contains the distribution and
+          # the generated Dockerfile printed here, and nothing else. Your source
+          # is not part of it.
+          mkdir -p "$RUNNER_TEMP/imgctx/app"
+          cp -a '.open-next'/. "$RUNNER_TEMP/imgctx/app/"
+          cat > "$RUNNER_TEMP/imgctx/Dockerfile" <<'DATADACK_DOCKERFILE'
+          FROM node:22-alpine
+          WORKDIR /app
+          COPY app ./
+          ENV NODE_ENV=production
+          ENV PORT=80
+          ENV HOSTNAME=0.0.0.0
+          EXPOSE 80
+          ENTRYPOINT ["node", "server-functions/default/index.mjs"]
+          DATADACK_DOCKERFILE
+          cat "$RUNNER_TEMP/imgctx/Dockerfile" | tee -a "$RUNNER_TEMP/datadack.log"
+          # The default buildx driver cannot export an OCI archive, so a
+          # docker-container builder is created here rather than pulling in a
+          # third-party setup action.
+          docker buildx create --name datadack --driver docker-container --use >/dev/null 2>&1 \
+            || docker buildx use datadack
+          set -o pipefail; docker buildx build --platform linux/amd64 \
+            --output type=oci,dest="$RUNNER_TEMP/image.tar",name=datadack-app:"$GITHUB_SHA" \
+            "$RUNNER_TEMP/imgctx" 2>&1 | tee -a "$RUNNER_TEMP/datadack.log"
+
+      - name: Check the image actually serves
+        run: |
+          set -e
+          # The image is RUN here, on your runner, before it is uploaded. An
+          # image that builds but does not serve is the worst failure this
+          # pipeline can produce: everything reports success, the container
+          # starts on the host, and the only symptom is a health check timing
+          # out minutes later on a machine you cannot see. Catching it here puts
+          # the evidence in this log instead.
+          #
+          # Rebuilding with --load is nearly free: it is the same context and
+          # every layer is already in the buildx cache from the step above.
+          docker buildx build --platform linux/amd64 --load \
+            -t datadack-smoke:local "$RUNNER_TEMP/imgctx" >/dev/null
+          docker rm -f datadack-smoke >/dev/null 2>&1 || true
+          docker run -d --name datadack-smoke -p 18080:80 datadack-smoke:local >/dev/null
+
+          ok=""
+          for i in $(seq 1 45); do
+            # No "|| echo" here: curl -w already prints 000 when it cannot
+            # connect, and appending a second 000 produced "000000" — which is
+            # not the string "000" and is numerically ZERO, so comparing it
+            # arithmetically against 500 accepted it and this test passed even
+            # when nothing had answered at all.
+            # Match the shape instead: only a real 1xx–4xx counts as served.
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18080/ 2>/dev/null) || true
+            case "$code" in
+              # A 404 is the customer's routing, not our packaging — the app
+              # bound the port and answered, which is all this step checks.
+              [1-4][0-9][0-9]) ok="$code"; break ;;
+            esac
+            sleep 2
+          done
+
+          if [ -z "$ok" ]; then
+            echo "::error::the built image does not serve on :80 — it will not deploy"
+            echo "--- container state ---";  docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}}' datadack-smoke || true
+            echo "--- container logs ----";  docker logs datadack-smoke 2>&1 | tail -40 || true
+            { echo; echo "--- image smoke test FAILED: nothing listening on :80 ---";
+              docker logs datadack-smoke 2>&1 | tail -40; } >> "$RUNNER_TEMP/datadack.log" || true
+            docker rm -f datadack-smoke >/dev/null 2>&1 || true
+            exit 1
+          fi
+          echo "image served HTTP $ok on :80"
+          echo "image smoke test passed (HTTP $ok)" >> "$RUNNER_TEMP/datadack.log"
+          docker rm -f datadack-smoke >/dev/null 2>&1 || true
+
+      - name: Upload the runtime image to DataDack
+        run: |
+          curl -sS --fail-with-body -X PUT \
+            --upload-file "$RUNNER_TEMP/image.tar" \
+            -H "Content-Type: application/x-tar" \
+            "${{ steps.claim.outputs.image_upload_url }}"
+
+      - name: Flush the remaining logs
+        if: always()
+        run: |
+          # Stop the streamer, then send whatever it had not shipped yet — a
+          # build that fails mid-step must still deliver the output that
+          # explains why.
+          touch "$RUNNER_TEMP/datadack.done" 2>/dev/null || true
+          sleep 4
+          if [ -s "$RUNNER_TEMP/datadack.log" ]; then
+            tail -c 65536 "$RUNNER_TEMP/datadack.log" \
+              | jq -Rs '{chunk: ("\n--- end of build output ---\n" + .)}' \
+              > "$RUNNER_TEMP/datadack.tail.json" || exit 0
+            curl -sS -X POST \
+              "${{ steps.claim.outputs.log_url }}" \
+              -H "Authorization: Bearer ${{ steps.claim.outputs.oidc }}" \
+              -H "Content-Type: application/json" \
+              --data-binary "@$RUNNER_TEMP/datadack.tail.json" >/dev/null || true
+          fi
+
+      - name: Report the result
+        if: always()
+        run: |
+          BUILD_ID="${{ steps.claim.outputs.build_id }}"
+          if [ -z "$BUILD_ID" ] || [ "$BUILD_ID" = "null" ]; then
+            exit 0   # never claimed a build; nothing to report against
+          fi
+          STATUS="failed"
+          SHA256=""
+          BYTES=0
+          IMG_SHA256=""
+          IMG_BYTES=0
+          if [ "${{ job.status }}" = "success" ]; then
+            STATUS="built"
+            SHA256=$(sha256sum "$RUNNER_TEMP/dist.zip" | cut -d' ' -f1)
+            BYTES=$(wc -c < "$RUNNER_TEMP/dist.zip")
+            IMG_SHA256=$(sha256sum "$RUNNER_TEMP/image.tar" | cut -d' ' -f1)
+            IMG_BYTES=$(wc -c < "$RUNNER_TEMP/image.tar")
+          fi
+          # Retried, and its failure is not swallowed. This one request is what
+          # turns a finished build into a deployable one, and it crosses the
+          # public internet: a single lost call leaves the build reported green
+          # here while DataDack still shows it building. That happened — an edge
+          # answered it with a 520 — so it retries on any error, including HTTP
+          # 5xx, and says so loudly if it still cannot get through.
+          if ! curl -sS --fail-with-body \
+            --retry 6 --retry-all-errors --retry-delay 5 --max-time 30 \
+            -X POST "$DATADACK_API/managedapps/actions/builds/$BUILD_ID/complete" \
+            -H "Authorization: Bearer ${{ steps.claim.outputs.oidc }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\":\"$STATUS\",\"sha256\":\"$SHA256\",\"bytes\":$BYTES,\"image_sha256\":\"$IMG_SHA256\",\"image_bytes\":$IMG_BYTES,\"job_status\":\"${{ job.status }}\"}"
+          then
+            echo "::warning::could not report the result to DataDack after 6 attempts."
+            echo "::warning::Your build is fine and its output is uploaded — DataDack reconciles this from storage when GitHub reports the run."
+          fi
